@@ -8,6 +8,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import (
     RandomForestClassifier,
     HistGradientBoostingClassifier,
@@ -48,6 +49,7 @@ def make_features(frame):
 
     if "deathdate" in data.columns:
         date = pd.to_datetime(data["deathdate"], errors="coerce")
+        data["death_year"] = date.dt.year
         data["death_dayofweek"] = date.dt.dayofweek
         data["death_dayofyear"] = date.dt.dayofyear
         data["death_month"] = date.dt.month
@@ -108,10 +110,6 @@ def make_features(frame):
 X = make_features(train)
 y = train[TARGET].astype(int)
 X_test = make_features(test)
-
-for col in ["location"]:
-    X = X.drop(columns=[col], errors="ignore")
-    X_test = X_test.drop(columns=[col], errors="ignore")
 
 for col in list(X.columns):
     if X[col].isna().all():
@@ -189,6 +187,27 @@ models.append(("hgb", Pipeline([
         random_state=42,
     ))
 ])))
+
+models.append(("mlp", Pipeline([
+    ("features", preprocessor),
+    ("classifier", MLPClassifier(
+        hidden_layer_sizes=(64, 32),
+        activation="relu",
+        alpha=0.01,
+        learning_rate_init=0.001,
+        early_stopping=True,
+        n_iter_no_change=25,
+        max_iter=500,
+        random_state=42,
+    ))
+])))
+
+if os.getenv("MLP_COMPARISON_ONLY") == "1":
+    models = [
+        (name, model)
+        for name, model in models
+        if name in {"logreg_C0.1", "mlp"}
+    ]
 
 X_train, X_valid, y_train, y_valid = train_test_split(
     X, y, test_size=0.2, stratify=y, random_state=42
