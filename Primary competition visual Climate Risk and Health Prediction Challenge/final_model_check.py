@@ -2,13 +2,15 @@ import os
 import warnings
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import SplineTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
 from sklearn.ensemble import (
     RandomForestClassifier,
     HistGradientBoostingClassifier,
@@ -16,6 +18,16 @@ from sklearn.ensemble import (
     GradientBoostingClassifier,
 )
 from sklearn.metrics import f1_score, roc_auc_score
+
+try:
+    from catboost import CatBoostClassifier
+except ImportError:
+    CatBoostClassifier = None
+
+try:
+    from lightgbm import LGBMClassifier
+except ImportError:
+    LGBMClassifier = None
 
 TRAIN_PATH = "Train.csv"
 TEST_PATH = "Test.csv" if os.path.exists("Test.csv") else "test.csv"
@@ -34,6 +46,7 @@ climate_candidates = [
 climate_path = next((c for c in climate_candidates if os.path.exists(c)), None)
 if climate_path is not None:
     climate_features = pd.read_csv(climate_path)
+    climate_features = climate_features.drop(columns=["deathdate"], errors="ignore")
     if ID_COLUMN not in climate_features.columns and "ID" in climate_features.columns:
         climate_features = climate_features.rename(columns={"ID": ID_COLUMN})
     climate_features = climate_features.drop_duplicates(subset=[ID_COLUMN], keep="last")
@@ -49,7 +62,7 @@ def make_features(frame):
 
     if "deathdate" in data.columns:
         date = pd.to_datetime(data["deathdate"], errors="coerce")
-        data["death_year"] = date.dt.year
+        data["death_year"] = date.dt.year.astype("Int64").astype(str)
         data["death_dayofweek"] = date.dt.dayofweek
         data["death_dayofyear"] = date.dt.dayofyear
         data["death_month"] = date.dt.month
@@ -100,16 +113,17 @@ def make_features(frame):
             data[col] = data[col].astype(str).str.strip()
             data[col] = data[col].replace({"nan": "", "None": "", "NaN": ""})
 
-    for col in data.select_dtypes(include=[np.number]).columns:
-        if np.isclose(data[col].nunique(dropna=True), 1):
-            data = data.drop(columns=[col])
-
     return data.drop(columns=[TARGET, ID_COLUMN], errors="ignore")
 
 
 X = make_features(train)
 y = train[TARGET].astype(int)
 X_test = make_features(test)
+
+if os.getenv("KEEP_LOCATION") != "1":
+    for col in ["location"]:
+        X = X.drop(columns=[col], errors="ignore")
+        X_test = X_test.drop(columns=[col], errors="ignore")
 
 for col in list(X.columns):
     if X[col].isna().all():
@@ -118,6 +132,9 @@ for col in list(X.columns):
 
 categorical = X.select_dtypes(include=["object", "category"]).columns.tolist()
 numeric = X.select_dtypes(exclude=["object", "category"]).columns.tolist()
+for col in categorical:
+    X[col] = X[col].fillna("__missing__").astype(str)
+    X_test[col] = X_test[col].fillna("__missing__").astype(str)
 
 preprocessor = ColumnTransformer([
     ("numeric", Pipeline([
@@ -127,6 +144,24 @@ preprocessor = ColumnTransformer([
     ("categorical", Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ]), categorical),
+])
+
+spline_preprocessor = ColumnTransformer([
+    ("numeric", Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("spline", SplineTransformer(
+            n_knots=4,
+            degree=3,
+            knots="quantile",
+            extrapolation="linear",
+            include_bias=False,
+        )),
+        ("scale", StandardScaler()),
+    ]), numeric),
+    ("categorical", Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
     ]), categorical),
 ])
 
@@ -142,6 +177,17 @@ for C in [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]:
             random_state=42,
         ))
     ])))
+
+models.append(("spline_logreg", Pipeline([
+    ("features", spline_preprocessor),
+    ("classifier", LogisticRegression(
+        C=0.5,
+        class_weight="balanced",
+        solver="liblinear",
+        max_iter=8000,
+        random_state=42,
+    ))
+])))
 
 models.append(("rf", Pipeline([
     ("features", preprocessor),
@@ -202,16 +248,90 @@ models.append(("mlp", Pipeline([
     ))
 ])))
 
-if os.getenv("MLP_COMPARISON_ONLY") == "1":
+models.append(("rbf_svc", Pipeline([
+    ("features", preprocessor),
+    ("classifier", SVC(
+        C=1.0,
+        kernel="rbf",
+        gamma="scale",
+        class_weight="balanced",
+        probability=True,
+        random_state=42,
+    ))
+])))
+
+if CatBoostClassifier is not None:
+    models.append(("catboost", Pipeline([
+        ("features", preprocessor),
+        ("classifier", CatBoostClassifier(
+            loss_function="Logloss",
+            eval_metric="AUC",
+            iterations=800,
+            learning_rate=0.03,
+            depth=6,
+            l2_leaf_reg=5,
+            auto_class_weights="Balanced",
+            verbose=False,
+            random_seed=42,
+        ))
+    ])))
+    models.append(("catboost_native", CatBoostClassifier(
+        loss_function="Logloss",
+        eval_metric="AUC",
+        iterations=1000,
+        learning_rate=0.03,
+        depth=5,
+        l2_leaf_reg=5,
+        auto_class_weights="Balanced",
+        cat_features=categorical,
+        verbose=False,
+        random_seed=42,
+        allow_writing_files=False,
+    )))
+
+if LGBMClassifier is not None:
+    models.append(("lightgbm", Pipeline([
+        ("features", preprocessor),
+        ("classifier", LGBMClassifier(
+            n_estimators=700,
+            learning_rate=0.025,
+            num_leaves=15,
+            max_depth=-1,
+            min_child_samples=25,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_alpha=0.1,
+            reg_lambda=3.0,
+            verbosity=-1,
+            random_state=42,
+            n_jobs=-1,
+        ))
+    ])))
+
+oof_tabular_only = os.getenv("OOF_TABULAR_ONLY") == "1"
+oof_logreg_only = os.getenv("OOF_LOGREG_ONLY") == "1"
+if oof_tabular_only or oof_logreg_only:
+    OUTPUT_PATH = "best_submission_oof.csv"
     models = [
         (name, model)
         for name, model in models
-        if name in {"logreg_C0.1", "mlp"}
+        if name.startswith("logreg_C")
+        or (oof_tabular_only and name in {"lightgbm", "rbf_svc", "spline_logreg"})
+    ]
+elif os.getenv("MLP_COMPARISON_ONLY") == "1":
+    models = [
+        (name, model)
+        for name, model in models
+        if name in {"logreg_C2.0", "mlp", "catboost", "catboost_native"}
     ]
 
-X_train, X_valid, y_train, y_valid = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=42
-)
+if oof_tabular_only or oof_logreg_only:
+    validation_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    X_valid, y_valid = X, y
+else:
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
 
 thresholds = np.linspace(0.10, 0.90, 161)
 best_model_name = None
@@ -220,13 +340,24 @@ best_threshold = 0.5
 best_score = -1.0
 best_valid_f1 = 0.0
 best_valid_auc = 0.0
+validation_probabilities = {}
 
 for model_name, model in models:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model.fit(X_train, y_train)
-
-    valid_probability = model.predict_proba(X_valid)[:, 1]
+        if oof_tabular_only or oof_logreg_only:
+            valid_probability = cross_val_predict(
+                model,
+                X,
+                y,
+                cv=validation_cv,
+                method="predict_proba",
+                n_jobs=1,
+            )[:, 1]
+        else:
+            model.fit(X_train, y_train)
+            valid_probability = model.predict_proba(X_valid)[:, 1]
+    validation_probabilities[model_name] = valid_probability
     valid_auc = roc_auc_score(y_valid, valid_probability)
 
     def competition_score(threshold, proba=valid_probability, auc=valid_auc):
@@ -246,14 +377,54 @@ for model_name, model in models:
         best_valid_f1 = current_f1
         best_valid_auc = valid_auc
 
+best_single_model_name = best_model_name
+best_blend = None
+if best_single_model_name is not None:
+    for other_name, other_probability in validation_probabilities.items():
+        if other_name == best_single_model_name:
+            continue
+        for other_weight in [0.1, 0.2, 0.3, 0.4, 0.5]:
+            blend_probability = (
+                (1 - other_weight) * validation_probabilities[best_single_model_name]
+                + other_weight * other_probability
+            )
+            blend_auc = roc_auc_score(y_valid, blend_probability)
+            blend_threshold = max(
+                thresholds,
+                key=lambda threshold: 0.60 * f1_score(
+                    y_valid, (blend_probability >= threshold).astype(int)
+                ) + 0.40 * blend_auc,
+            )
+            blend_f1 = f1_score(
+                y_valid, (blend_probability >= blend_threshold).astype(int)
+            )
+            blend_score = 0.60 * blend_f1 + 0.40 * blend_auc
+            if blend_score > best_score:
+                best_score = blend_score
+                best_model_name = f"blend_{best_single_model_name}_{other_name}"
+                best_blend = (best_single_model_name, other_name, other_weight)
+                best_threshold = blend_threshold
+                best_valid_f1 = blend_f1
+                best_valid_auc = blend_auc
+
 print(f"BEST_MODEL={best_model_name}")
 print(f"Valid F1: {best_valid_f1:.4f}")
 print(f"Valid ROC AUC: {best_valid_auc:.4f}")
 print(f"Competition score: {best_score:.4f}")
 print(f"Selected threshold: {best_threshold:.3f}")
 
-best_model.fit(X, y)
-final_probs = best_model.predict_proba(X_test)[:, 1]
+if best_blend is None:
+    best_model.fit(X, y)
+    final_probs = best_model.predict_proba(X_test)[:, 1]
+else:
+    left_name, right_name, right_weight = best_blend
+    model_by_name = dict(models)
+    left_model = model_by_name[left_name].fit(X, y)
+    right_model = model_by_name[right_name].fit(X, y)
+    final_probs = (
+        (1 - right_weight) * left_model.predict_proba(X_test)[:, 1]
+        + right_weight * right_model.predict_proba(X_test)[:, 1]
+    )
 submission = pd.DataFrame({
     ID_COLUMN: test[ID_COLUMN],
     "TargetF1": (final_probs >= best_threshold).astype(int),
