@@ -60,6 +60,13 @@ else:
 def make_features(frame):
     data = frame.copy()
 
+    if os.getenv("ID_FEATURES") == "1" and ID_COLUMN in data.columns:
+        id_code = data[ID_COLUMN].astype(str).str.partition("_")[2].str.upper()
+        for position in range(8):
+            data[f"id_char_{position}"] = id_code.str.slice(position, position + 1)
+        data["id_prefix_2"] = id_code.str.slice(0, 2)
+        data["id_suffix_2"] = id_code.str.slice(-2)
+
     if "deathdate" in data.columns:
         date = pd.to_datetime(data["deathdate"], errors="coerce")
         data["death_year"] = date.dt.year.astype("Int64").astype(str)
@@ -172,6 +179,22 @@ for C in [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]:
         ("classifier", LogisticRegression(
             C=C,
             class_weight="balanced",
+            solver="liblinear",
+            max_iter=8000,
+            random_state=42,
+        ))
+    ])))
+
+for weight_name, class_weight in [
+    ("unweighted", None),
+    ("positive_1_2", {0: 1.0, 1: 1.2}),
+    ("positive_1_5", {0: 1.0, 1: 1.5}),
+]:
+    models.append((f"logreg_{weight_name}", Pipeline([
+        ("features", preprocessor),
+        ("classifier", LogisticRegression(
+            C=0.5,
+            class_weight=class_weight,
             solver="liblinear",
             max_iter=8000,
             random_state=42,
@@ -310,12 +333,18 @@ if LGBMClassifier is not None:
 
 oof_tabular_only = os.getenv("OOF_TABULAR_ONLY") == "1"
 oof_logreg_only = os.getenv("OOF_LOGREG_ONLY") == "1"
-if oof_tabular_only or oof_logreg_only:
+candidate_model = os.getenv("CANDIDATE_MODEL")
+if candidate_model:
+    models = [(name, model) for name, model in models if name == candidate_model]
+    if not models:
+        raise ValueError(f"Unknown candidate model: {candidate_model}")
+    OUTPUT_PATH = f"submission_{candidate_model}.csv"
+elif oof_tabular_only or oof_logreg_only:
     OUTPUT_PATH = "best_submission_oof.csv"
     models = [
         (name, model)
         for name, model in models
-        if name.startswith("logreg_C")
+        if name.startswith("logreg")
         or (oof_tabular_only and name in {"lightgbm", "rbf_svc", "spline_logreg"})
     ]
 elif os.getenv("MLP_COMPARISON_ONLY") == "1":
