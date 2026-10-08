@@ -14,8 +14,15 @@ RUN:   python gee_extract_features.py   (from the folder with Train.csv / Test.c
 OUT:   files 'climate_extra_batch_N.csv' appear in your Google Drive folder
        'zindi_climate'. Download them, concatenate, and upload the result here.
 """
-import ee
+try:
+    import ee
+except ImportError:
+    ee = None
+
 import pandas as pd
+
+if ee is None:
+    raise ImportError("Install the Earth Engine client library before running this script: pip install earthengine-api pandas")
 
 PROJECT = "YOUR_GOOGLE_CLOUD_PROJECT_ID"
 BATCH = 400                       # records per export task (reduce if tasks time out)
